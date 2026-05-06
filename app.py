@@ -2,10 +2,9 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from io import BytesIO
-import os
-import json
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
@@ -66,26 +65,20 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def now_text(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def display_now(): return datetime.now().strftime("%I:%M %p").lstrip("0")
-def display_date(): return datetime.now().strftime("%A, %b %d, %Y")
+CHICAGO_TZ = ZoneInfo("America/Chicago")
+
+def chicago_now():
+    return datetime.now(CHICAGO_TZ)
+
+def chicago_today():
+    return chicago_now().date()
+
+def now_text(): return chicago_now().strftime("%Y-%m-%d %H:%M:%S")
+def display_now(): return chicago_now().strftime("%I:%M %p").lstrip("0")
+def display_date(): return chicago_now().strftime("%A, %b %d, %Y")
 def cid(x): return str(x).strip().upper()
 
 def get_secret():
-    # Railway: paste the full credentials.json text into variable GCP_SERVICE_ACCOUNT_JSON
-    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
-    if raw:
-        try:
-            info = json.loads(raw)
-            if "private_key" in info:
-                info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
-            return info
-        except Exception as e:
-            st.error("GCP_SERVICE_ACCOUNT_JSON is not valid JSON. Re-copy the full credentials.json file into Railway Variables.")
-            st.code(str(e))
-            st.stop()
-
-    # Local/Streamlit Cloud fallback
     try:
         if "gcp_service_account" in st.secrets:
             info = dict(st.secrets["gcp_service_account"])
@@ -106,7 +99,7 @@ def connect_sheet():
     if info:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return gspread.authorize(creds).open_by_key(SHEET_ID)
-    st.error("Google credentials missing. On Railway, add variable GCP_SERVICE_ACCOUNT_JSON with the full credentials.json text. For local testing, keep credentials.json next to app.py.")
+    st.error("Google credentials missing. Put credentials.json in the same folder as app.py.")
     st.stop()
 
 def get_ws(sheet, name, headers):
@@ -191,7 +184,7 @@ def employee_rows(logs, emp_id):
 
 def today_rows(logs, emp_id):
     rows = employee_rows(logs, emp_id)
-    return rows[rows["work_date"].astype(str) == str(date.today())] if not rows.empty else rows
+    return rows[rows["work_date"].astype(str) == str(chicago_today())] if not rows.empty else rows
 
 def last_row_for_employee(logs, emp_id):
     rows = today_rows(logs, emp_id)
@@ -421,7 +414,7 @@ if page == "Employee Clock":
             else:
                 backup_attendance(log_ws, backup_ws, "Before Office In")
                 t = now_text()
-                row = {"id":cid(emp["id"]), "name":emp["name"], "team":emp["team"], "work_date":str(date.today()), "punch_in":t, "break_start":"", "break_end":"", "punch_out":"", "break_hours":"", "work_hours":"", "status":"Working", "notes":notes}
+                row = {"id":cid(emp["id"]), "name":emp["name"], "team":emp["team"], "work_date":str(chicago_today()), "punch_in":t, "break_start":"", "break_end":"", "punch_out":"", "break_hours":"", "work_hours":"", "status":"Working", "notes":notes}
                 append_attendance(log_ws, row)
                 append_audit(audit_ws, "Office In", emp, "Working", f"Office In saved at {nice_time(t)}", notes)
                 logs = pd.concat([logs, pd.DataFrame([row])], ignore_index=True)
@@ -503,7 +496,7 @@ if page == "Employee Clock":
                     msg("good", f"Office Out saved at {nice_time(t)}")
 
     st.markdown(f"<div class='status-bar'>Status: {status}</div>", unsafe_allow_html=True)
-    today_count = len(logs[logs["work_date"].astype(str)==str(date.today())]) if not logs.empty else 0
+    today_count = len(logs[logs["work_date"].astype(str)==str(chicago_today())]) if not logs.empty else 0
     open_count = len(logs[logs["punch_out"].astype(str).str.strip()==""]) if not logs.empty else 0
     m1, m2, m3 = st.columns(3)
     with m1: st.markdown(f"<div class='metric-card'><div class='metric-label'>Today Punches</div><div class='metric-value'>{today_count}</div></div>", unsafe_allow_html=True)
@@ -566,7 +559,7 @@ elif page == "Payroll":
         st.stop()
 
     base = report_base(logs)
-    today = date.today()
+    today = chicago_today()
     week_start = today - timedelta(days=today.weekday())
     week_end = week_start + timedelta(days=6)
 
