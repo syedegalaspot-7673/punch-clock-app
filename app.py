@@ -1,10 +1,11 @@
 
 import streamlit as st
 import pandas as pd
-import os
-import json
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+import os
+import json
+import time
 from pathlib import Path
 from io import BytesIO
 import gspread
@@ -35,6 +36,14 @@ HOURLY_RATES = {
     "Omer H": 14.00,
     "Omar H": 14.00,
 }
+
+CHICAGO_TZ = ZoneInfo("America/Chicago")
+
+def chicago_now():
+    return datetime.now(CHICAGO_TZ)
+
+def chicago_today():
+    return chicago_now().date()
 
 st.set_page_config(page_title="Egala Spot WorkClock", page_icon="ES", layout="wide")
 
@@ -67,27 +76,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-CHICAGO_TZ = ZoneInfo("America/Chicago")
-
-def chicago_now():
-    return datetime.now(CHICAGO_TZ)
-
-def chicago_today():
-    return chicago_now().date()
-
-def now_text():
-    return chicago_now().strftime("%Y-%m-%d %H:%M:%S")
-
-def display_now():
-    return chicago_now().strftime("%I:%M %p").lstrip("0")
-
-def display_date():
-    return chicago_now().strftime("%A, %b %d, %Y")
-
+def now_text(): return chicago_now().strftime("%Y-%m-%d %H:%M:%S")
+def display_now(): return chicago_now().strftime("%I:%M %p").lstrip("0")
+def display_date(): return chicago_now().strftime("%A, %b %d, %Y")
 def cid(x): return str(x).strip().upper()
 
 def get_secret():
-    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    # Railway: paste full Google service account JSON into variable GCP_SERVICE_ACCOUNT_JSON
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
     if raw:
         try:
             info = json.loads(raw)
@@ -95,7 +91,7 @@ def get_secret():
                 info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
             return info
         except Exception as e:
-            st.error("Railway Google credential variable is invalid JSON.")
+            st.error("GCP_SERVICE_ACCOUNT_JSON exists but is not valid JSON.")
             st.code(str(e))
             st.stop()
     try:
@@ -118,7 +114,7 @@ def connect_sheet():
     if info:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return gspread.authorize(creds).open_by_key(SHEET_ID)
-    st.error("Google credentials missing. On Railway, add GCP_SERVICE_ACCOUNT_JSON variable with full service account JSON. For local testing, keep credentials.json next to app.py.")
+    st.error("Google credentials missing. Put credentials.json in the same folder as app.py.")
     st.stop()
 
 def get_ws(sheet, name, headers):
@@ -128,15 +124,33 @@ def get_ws(sheet, name, headers):
         ws = sheet.add_worksheet(title=name, rows=5000, cols=max(len(headers), 20))
         ws.append_row(headers)
         return ws
-    vals = ws.get_all_values()
+    vals = sheet_values(ws)
     if not vals:
         ws.append_row(headers)
     elif vals[0] != headers:
         st.warning(f"{name} headers do not match expected format. Existing data was NOT erased.")
     return ws
 
-def read_ws(ws, headers, keep_row_number=False):
-    vals = ws.get_all_values()
+
+def sheet_values(ws, retries=3):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return ws.get_all_values()
+        except Exception as e:
+            last_error = e
+            time.sleep(1.5 * (attempt + 1))
+    raise last_error
+
+def clear_sheet_cache():
+    try:
+        read_ws.clear()
+    except Exception:
+        pass
+
+@st.cache_data(ttl=20, show_spinner=False)
+def read_ws(_ws, headers, keep_row_number=False):
+    vals = sheet_values(_ws)
     if len(vals) <= 1:
         df = pd.DataFrame(columns=headers, dtype=str)
         if keep_row_number: df["_row"] = []
@@ -219,15 +233,18 @@ def detail_box(label, value):
     st.markdown(f"<div class='detail-box'><div class='detail-label'>{label}</div><div class='detail-value'>{value}</div></div>", unsafe_allow_html=True)
 
 def append_audit(audit_ws, action, emp=None, status="", message="", notes=""):
+    clear_sheet_cache()
     t = now_text()
     if emp is None:
         row = [t, action, "", "", "", status, message, notes]
     else:
         row = [t, action, cid(emp.get("id","")), emp.get("name",""), emp.get("team",""), status, message, notes]
     audit_ws.append_row([str(x) for x in row])
+    clear_sheet_cache()
 
 def backup_attendance(attendance_ws, backup_ws, reason):
-    vals = attendance_ws.get_all_values()
+    clear_sheet_cache()
+    vals = sheet_values(attendance_ws)
     if len(vals) <= 1:
         backup_ws.append_row([now_text(), reason] + [""] * len(LOG_HEADERS))
         return
@@ -237,15 +254,20 @@ def backup_attendance(attendance_ws, backup_ws, reason):
         if str(r[0]).strip().lower() in ["", "id"]: continue
         rows.append([t, reason] + r)
     if rows: backup_ws.append_rows(rows)
+    clear_sheet_cache()
 
 def append_attendance(log_ws, row_dict):
+    clear_sheet_cache()
     log_ws.append_row([str(row_dict.get(h, "")) for h in LOG_HEADERS])
+    clear_sheet_cache()
 
 def update_attendance_row(log_ws, sheet_row, updates):
+    clear_sheet_cache()
     header_pos = {h: i+1 for i, h in enumerate(LOG_HEADERS)}
     for key, val in updates.items():
         if key in header_pos:
             log_ws.update_cell(int(sheet_row), header_pos[key], str(val))
+    clear_sheet_cache()
 
 def report_base(logs):
     df = calc_logs(logs.drop(columns=["_row"], errors="ignore")).copy()
@@ -301,7 +323,9 @@ def save_payroll_snapshot(archive_ws, summary, report_type, start_date, end_date
             str(r.get("total_work_hours","")), str(r.get("total_break_hours","")),
             str(r.get("shifts","")), notes
         ])
+    clear_sheet_cache()
     archive_ws.append_rows(rows)
+    clear_sheet_cache()
     return len(rows)
 
 
