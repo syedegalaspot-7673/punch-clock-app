@@ -4,6 +4,8 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from io import BytesIO
+import os
+import json
 import gspread
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
@@ -70,6 +72,20 @@ def display_date(): return datetime.now().strftime("%A, %b %d, %Y")
 def cid(x): return str(x).strip().upper()
 
 def get_secret():
+    # Railway: paste the full credentials.json text into variable GCP_SERVICE_ACCOUNT_JSON
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw:
+        try:
+            info = json.loads(raw)
+            if "private_key" in info:
+                info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
+            return info
+        except Exception as e:
+            st.error("GCP_SERVICE_ACCOUNT_JSON is not valid JSON. Re-copy the full credentials.json file into Railway Variables.")
+            st.code(str(e))
+            st.stop()
+
+    # Local/Streamlit Cloud fallback
     try:
         if "gcp_service_account" in st.secrets:
             info = dict(st.secrets["gcp_service_account"])
@@ -90,7 +106,7 @@ def connect_sheet():
     if info:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return gspread.authorize(creds).open_by_key(SHEET_ID)
-    st.error("Google credentials missing. Put credentials.json in the same folder as app.py.")
+    st.error("Google credentials missing. On Railway, add variable GCP_SERVICE_ACCOUNT_JSON with the full credentials.json text. For local testing, keep credentials.json next to app.py.")
     st.stop()
 
 def get_ws(sheet, name, headers):
