@@ -37,6 +37,7 @@ DEFAULT_EMPLOYEES = [
     ("13", "Waleed Ahmed", "1234", "Remote", "active"),
     ("14", "Maria Shuja", "1234", "Local", "active"),
     ("15", "Meryem E", "1234", "Local", "active"),
+    ("16", "Arham Ahmed", "1342", "Remote", "active"),
 ]
 
 st.set_page_config(page_title="Egala Spot WorkClock", page_icon="ES", layout="wide")
