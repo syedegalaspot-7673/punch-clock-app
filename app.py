@@ -5,8 +5,6 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from io import BytesIO
 import gspread
-import os
-import json
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
@@ -25,6 +23,15 @@ PAYROLL_ARCHIVE_HEADERS = [
 LOCAL_NAMES = ["Syed Hassan", "Maria Shuja", "Omer H", "Meryem E"]
 LOCAL_TEAMS = ["local", "local il", "admin", "wh", "warehouse"]
 REMOTE_TEAMS = ["remote", "pakistan", "overseas"]
+
+HOURLY_RATES = {
+    "Syed Hassan": 18.00,
+    "Maria Shuja": 16.00,
+    "Meryem E": 13.00,
+    "Maryem E": 13.00,
+    "Omer H": 14.00,
+    "Omar H": 14.00,
+}
 
 st.set_page_config(page_title="Egala Spot WorkClock", page_icon="ES", layout="wide")
 
@@ -63,7 +70,6 @@ def display_date(): return datetime.now().strftime("%A, %b %d, %Y")
 def cid(x): return str(x).strip().upper()
 
 def get_secret():
-    # 1) Streamlit secrets for local/Streamlit Cloud
     try:
         if "gcp_service_account" in st.secrets:
             info = dict(st.secrets["gcp_service_account"])
@@ -71,21 +77,7 @@ def get_secret():
                 info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
             return info
     except Exception:
-        pass
-
-    # 2) Railway environment variable: paste the full service-account JSON
-    raw_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
-    if raw_json:
-        try:
-            info = json.loads(raw_json)
-            if "private_key" in info:
-                info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
-            return info
-        except Exception as e:
-            st.error("GCP_SERVICE_ACCOUNT_JSON is not valid JSON.")
-            st.code(str(e))
-            st.stop()
-
+        return None
     return None
 
 @st.cache_resource
@@ -98,7 +90,7 @@ def connect_sheet():
     if info:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return gspread.authorize(creds).open_by_key(SHEET_ID)
-    st.error("Google credentials missing. On Railway, add variable GCP_SERVICE_ACCOUNT_JSON with your full Google service-account JSON. For local testing, keep credentials.json next to app.py.")
+    st.error("Google credentials missing. Put credentials.json in the same folder as app.py.")
     st.stop()
 
 def get_ws(sheet, name, headers):
@@ -263,6 +255,10 @@ def summarize_report(df, start_date, end_date, group_type):
     )
     summary["total_work_hours"] = summary["total_work_hours"].round(2)
     summary["total_break_hours"] = summary["total_break_hours"].round(2)
+
+    if group_type == "local":
+        summary["hourly_rate"] = summary["name"].map(HOURLY_RATES).fillna(0).astype(float)
+        summary["weekly_salary"] = (summary["total_work_hours"].astype(float) * summary["hourly_rate"]).round(2)
     return summary
 
 def save_payroll_snapshot(archive_ws, summary, report_type, start_date, end_date, notes=""):
