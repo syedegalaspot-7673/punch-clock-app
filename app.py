@@ -1,6 +1,8 @@
 
 import streamlit as st
 import pandas as pd
+import os
+import json
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -73,12 +75,29 @@ def chicago_now():
 def chicago_today():
     return chicago_now().date()
 
-def now_text(): return chicago_now().strftime("%Y-%m-%d %H:%M:%S")
-def display_now(): return chicago_now().strftime("%I:%M %p").lstrip("0")
-def display_date(): return chicago_now().strftime("%A, %b %d, %Y")
+def now_text():
+    return chicago_now().strftime("%Y-%m-%d %H:%M:%S")
+
+def display_now():
+    return chicago_now().strftime("%I:%M %p").lstrip("0")
+
+def display_date():
+    return chicago_now().strftime("%A, %b %d, %Y")
+
 def cid(x): return str(x).strip().upper()
 
 def get_secret():
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if raw:
+        try:
+            info = json.loads(raw)
+            if "private_key" in info:
+                info["private_key"] = str(info["private_key"]).replace("\\n", "\n")
+            return info
+        except Exception as e:
+            st.error("Railway Google credential variable is invalid JSON.")
+            st.code(str(e))
+            st.stop()
     try:
         if "gcp_service_account" in st.secrets:
             info = dict(st.secrets["gcp_service_account"])
@@ -99,7 +118,7 @@ def connect_sheet():
     if info:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return gspread.authorize(creds).open_by_key(SHEET_ID)
-    st.error("Google credentials missing. Put credentials.json in the same folder as app.py.")
+    st.error("Google credentials missing. On Railway, add GCP_SERVICE_ACCOUNT_JSON variable with full service account JSON. For local testing, keep credentials.json next to app.py.")
     st.stop()
 
 def get_ws(sheet, name, headers):
