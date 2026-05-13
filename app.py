@@ -37,7 +37,6 @@ DEFAULT_EMPLOYEES = [
     ("13", "Waleed Ahmed", "1234", "Remote", "active"),
     ("14", "Maria Shuja", "1234", "Local", "active"),
     ("15", "Meryem E", "1234", "Local", "active"),
-    ("16", "Arham Ahmed", "1342", "Remote", "active"),
 ]
 
 st.set_page_config(page_title="Egala Spot WorkClock", page_icon="ES", layout="wide")
@@ -154,6 +153,19 @@ def nice_time(x):
 def calc_hours(pi, bs, be, po):
     pi, bs, be, po = map(safe_dt, [pi, bs, be, po])
     bh = wh = 0.0
+
+    # Repair common manual-entry mistake:
+    # 10:00 AM to 6:00 AM should mean 6:00 PM.
+    if pi and po and po < pi:
+        po = po + timedelta(hours=12)
+        if po < pi:
+            po = po + timedelta(hours=12)
+
+    if bs and be and be < bs:
+        be = be + timedelta(hours=12)
+        if be < bs:
+            be = be + timedelta(hours=12)
+
     if bs and be:
         bh = round(max((be - bs).total_seconds() / 3600, 0), 2)
     if pi and po:
@@ -244,6 +256,73 @@ def office_out(emp, notes):
     exec_sql("UPDATE attendance SET punch_out=?,break_hours=?,work_hours=?,status='Completed' WHERE rowid=?", (t, bh, wh, cur["rowid"]))
     audit("Office Out", emp, "Completed", f"Office Out saved at {nice_time(t)}", notes)
     return "good", f"Office Out saved at {nice_time(t)}"
+
+
+def parse_manual_time(time_value):
+    raw = str(time_value or "").strip()
+    if not raw:
+        return None
+
+    cleaned = raw.upper().replace(".", "").strip()
+    has_ampm = ("AM" in cleaned) or ("PM" in cleaned)
+
+    # Exact AM/PM formats first.
+    for fmt in ["%I:%M %p", "%I:%M%p", "%I %p", "%I%p"]:
+        try:
+            return datetime.strptime(cleaned, fmt).time()
+        except Exception:
+            pass
+
+    # If user types 5:00 / 6:00 / 7:00 with no AM/PM, treat it as PM.
+    # 8:00, 9:00, 10:00, 11:00 are treated as AM because those are common office-in times.
+    if not has_ampm:
+        try:
+            parts = cleaned.split(":")
+            hour = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+            if 1 <= hour <= 7:
+                hour += 12
+            return datetime.strptime(f"{hour:02d}:{minute:02d}", "%H:%M").time()
+        except Exception:
+            pass
+
+    for fmt in ["%H:%M"]:
+        try:
+            return datetime.strptime(cleaned, fmt).time()
+        except Exception:
+            pass
+
+    return None
+
+def format_manual_dt(day_value, time_value):
+    if not day_value or not time_value:
+        return ""
+    parsed_time = parse_manual_time(time_value)
+    if parsed_time is None:
+        raise ValueError(f"Invalid time: {time_value}. Use format like 9:00 AM or 17:00.")
+    return datetime.combine(day_value, parsed_time).strftime("%m/%d/%Y %I:%M:%S %p")
+
+def save_manual_shift(emp_id, emp_name, emp_team, work_day, punch_in, break_start, break_end, punch_out, notes, rowid=None):
+    bh, wh = calc_hours(punch_in, break_start, break_end, punch_out)
+    status = "Completed" if punch_out else ("On Break" if break_start and not break_end else ("Working" if punch_in else "Manual"))
+    work_day_text = work_day.strftime("%Y-%m-%d") if hasattr(work_day, "strftime") else str(work_day)
+
+    if rowid:
+        exec_sql("""UPDATE attendance
+                    SET id=?, name=?, team=?, work_date=?, punch_in=?, break_start=?, break_end=?, punch_out=?,
+                        break_hours=?, work_hours=?, status=?, notes=?
+                    WHERE rowid=?""",
+                 (cid(emp_id), emp_name, emp_team, work_day_text, punch_in, break_start, break_end, punch_out,
+                  bh, wh, status, notes, int(rowid)))
+        audit("Manual Payroll Edit", {"id": emp_id, "name": emp_name, "team": emp_team}, status, f"Updated attendance row {rowid}. Work hours {wh}, break hours {bh}", notes)
+        return f"Updated shift for {emp_name}. Work hours: {wh}, Break hours: {bh}"
+    else:
+        exec_sql("""INSERT INTO attendance(id,name,team,work_date,punch_in,break_start,break_end,punch_out,break_hours,work_hours,status,notes)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 (cid(emp_id), emp_name, emp_team, work_day_text, punch_in, break_start, break_end, punch_out,
+                  bh, wh, status, notes))
+        audit("Manual Payroll Add", {"id": emp_id, "name": emp_name, "team": emp_team}, status, f"Added manual shift. Work hours {wh}, break hours {bh}", notes)
+        return f"Added manual shift for {emp_name}. Work hours: {wh}, Break hours: {bh}"
 
 def report_base():
     df = read_sql("SELECT * FROM attendance ORDER BY rowid DESC")
@@ -433,6 +512,130 @@ elif page == "Payroll":
     rdetails = base[(base.work_date_dt >= pd.to_datetime(rs)) & (base.work_date_dt <= pd.to_datetime(re))].drop(columns=["work_date_dt", "work_num", "break_num"], errors="ignore") if not base.empty else pd.DataFrame()
     st.dataframe(rsumm, use_container_width=True, hide_index=True)
     st.download_button("Download Monthly Overseas Payroll Excel", excel_bytes(rsumm, rdetails, "Monthly Overseas Payroll", rs, re), f"monthly_overseas_payroll_{rs}_to_{re}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+    st.divider()
+    st.subheader("Manual Payroll Edit")
+    st.caption("Use this when someone forgets to Office In / Break / Office Out. This can be used for employees, Syed, and Maria. Every manual save is recorded in AuditLog.")
+
+    if st.button("Repair Manual Hours / Refresh Payroll Totals", use_container_width=True):
+        rows_to_fix = read_sql("SELECT rowid,punch_in,break_start,break_end,punch_out FROM attendance")
+        fixed_count = 0
+        for _, rr in rows_to_fix.iterrows():
+            bh_fix, wh_fix = calc_hours(rr.get("punch_in",""), rr.get("break_start",""), rr.get("break_end",""), rr.get("punch_out",""))
+            exec_sql("UPDATE attendance SET break_hours=?, work_hours=? WHERE rowid=?", (bh_fix, wh_fix, int(rr["rowid"])))
+            fixed_count += 1
+        audit("Repair Manual Hours", None, "Completed", f"Recalculated {fixed_count} attendance rows", "")
+        st.success(f"Recalculated {fixed_count} attendance rows. Weekly/monthly reports are refreshed.")
+        st.rerun()
+
+    edit_mode = st.radio("Manual action", ["Add Missing Shift", "Edit Existing Shift"], horizontal=True)
+
+    emp_df_manual = read_sql("SELECT id,name,team FROM employees WHERE lower(active) IN ('true','yes','1','active') ORDER BY name")
+    if emp_df_manual.empty:
+        st.warning("No employees found.")
+    else:
+        if edit_mode == "Add Missing Shift":
+            emp_names_manual = emp_df_manual["name"].tolist()
+            selected_manual_name = st.selectbox("Employee / Owner", emp_names_manual, key="manual_add_employee")
+            emp_manual = emp_df_manual[emp_df_manual["name"] == selected_manual_name].iloc[0].to_dict()
+
+            cA, cB, cC = st.columns(3)
+            work_day_manual = cA.date_input("Work Date", value=today, key="manual_add_date")
+            punch_in_time = cB.text_input("Office In Time", value="9:00 AM", key="manual_add_in")
+            punch_out_time = cC.text_input("Office Out Time", value="5:00 PM", key="manual_add_out")
+
+            cD, cE = st.columns(2)
+            use_break = cD.checkbox("Include Break", value=False, key="manual_add_break_yes")
+            manual_notes = cE.text_input("Reason / Notes", value="Manual payroll correction", key="manual_add_notes")
+
+            break_start_text = ""
+            break_end_text = ""
+            if use_break:
+                cF, cG = st.columns(2)
+                break_start_time = cF.text_input("Break Start Time", value="12:00 PM", key="manual_add_break_start")
+                break_end_time = cG.text_input("Break End Time", value="12:30 PM", key="manual_add_break_end")
+                break_start_text = format_manual_dt(work_day_manual, break_start_time)
+                break_end_text = format_manual_dt(work_day_manual, break_end_time)
+
+            punch_in_text = format_manual_dt(work_day_manual, punch_in_time)
+            punch_out_text = format_manual_dt(work_day_manual, punch_out_time)
+
+            if st.button("Save Manual Missing Shift", use_container_width=True):
+                try:
+                    punch_in_text = format_manual_dt(work_day_manual, punch_in_time)
+                    punch_out_text = format_manual_dt(work_day_manual, punch_out_time)
+                    if use_break:
+                        break_start_text = format_manual_dt(work_day_manual, break_start_time)
+                        break_end_text = format_manual_dt(work_day_manual, break_end_time)
+                    message = save_manual_shift(emp_manual["id"], emp_manual["name"], emp_manual["team"], work_day_manual,
+                                                punch_in_text, break_start_text, break_end_text, punch_out_text, manual_notes)
+                    st.success(message)
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+        else:
+            existing = read_sql("""SELECT rowid,id,name,team,work_date,punch_in,break_start,break_end,punch_out,break_hours,work_hours,status,notes
+                                   FROM attendance ORDER BY rowid DESC LIMIT 300""")
+            if existing.empty:
+                st.info("No attendance rows to edit.")
+            else:
+                existing["label"] = existing.apply(lambda r: f"Row {r['rowid']} | {r['name']} | {r['work_date']} | {r['status']} | {r['work_hours']} hrs", axis=1)
+                selected_label = st.selectbox("Select shift to edit", existing["label"].tolist(), key="manual_edit_row")
+                selected_row = existing[existing["label"] == selected_label].iloc[0].to_dict()
+
+                emp_match = emp_df_manual[emp_df_manual["id"].astype(str).str.upper() == str(selected_row["id"]).upper()]
+                default_emp_name = emp_match.iloc[0]["name"] if not emp_match.empty else selected_row["name"]
+                emp_names_manual = emp_df_manual["name"].tolist()
+                default_index = emp_names_manual.index(default_emp_name) if default_emp_name in emp_names_manual else 0
+
+                edit_emp_name = st.selectbox("Employee / Owner", emp_names_manual, index=default_index, key="manual_edit_employee")
+                edit_emp = emp_df_manual[emp_df_manual["name"] == edit_emp_name].iloc[0].to_dict()
+
+                default_date = pd.to_datetime(selected_row.get("work_date", ""), errors="coerce")
+                if pd.isna(default_date):
+                    default_date = pd.Timestamp(today)
+
+                def default_time(value, fallback):
+                    dt = pd.to_datetime(value, errors="coerce")
+                    return fallback if pd.isna(dt) else dt.time()
+
+                cH, cI, cJ = st.columns(3)
+                edit_work_day = cH.date_input("Work Date", value=default_date.date(), key="manual_edit_date")
+                edit_in_time = cI.text_input("Office In Time", value=nice_time(selected_row.get("punch_in","")) if nice_time(selected_row.get("punch_in","")) != "-" else "9:00 AM", key="manual_edit_in")
+                edit_out_time = cJ.text_input("Office Out Time", value=nice_time(selected_row.get("punch_out","")) if nice_time(selected_row.get("punch_out","")) != "-" else "5:00 PM", key="manual_edit_out")
+
+                cK, cL = st.columns(2)
+                edit_has_break = cK.checkbox("Include Break", value=bool(str(selected_row.get("break_start","")).strip()), key="manual_edit_break_yes")
+                edit_notes = cL.text_input("Reason / Notes", value=str(selected_row.get("notes","") or "Manual payroll correction"), key="manual_edit_notes")
+
+                edit_break_start_text = ""
+                edit_break_end_text = ""
+                if edit_has_break:
+                    cM, cN = st.columns(2)
+                    edit_break_start = cM.text_input("Break Start Time", value=nice_time(selected_row.get("break_start","")) if nice_time(selected_row.get("break_start","")) != "-" else "12:00 PM", key="manual_edit_break_start")
+                    edit_break_end = cN.text_input("Break End Time", value=nice_time(selected_row.get("break_end","")) if nice_time(selected_row.get("break_end","")) != "-" else "12:30 PM", key="manual_edit_break_end")
+                    edit_break_start_text = format_manual_dt(edit_work_day, edit_break_start)
+                    edit_break_end_text = format_manual_dt(edit_work_day, edit_break_end)
+
+                edit_punch_in_text = format_manual_dt(edit_work_day, edit_in_time)
+                edit_punch_out_text = format_manual_dt(edit_work_day, edit_out_time)
+
+                if st.button("Save Edited Shift", use_container_width=True):
+                    try:
+                        edit_punch_in_text = format_manual_dt(edit_work_day, edit_in_time)
+                        edit_punch_out_text = format_manual_dt(edit_work_day, edit_out_time)
+                        if edit_has_break:
+                            edit_break_start_text = format_manual_dt(edit_work_day, edit_break_start)
+                            edit_break_end_text = format_manual_dt(edit_work_day, edit_break_end)
+                        message = save_manual_shift(edit_emp["id"], edit_emp["name"], edit_emp["team"], edit_work_day,
+                                                    edit_punch_in_text, edit_break_start_text, edit_break_end_text,
+                                                    edit_punch_out_text, edit_notes, rowid=selected_row["rowid"])
+                        st.success(message)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
     st.divider()
     st.subheader("All Completed Shift Details")
     st.dataframe(base.drop(columns=["work_date_dt", "work_num", "break_num"], errors="ignore") if not base.empty else pd.DataFrame(), use_container_width=True, hide_index=True)
