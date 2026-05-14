@@ -5,13 +5,15 @@ import sqlite3
 from datetime import datetime, date, timedelta
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "2.2-production-persistence-locked"
+APP_VERSION = "2.3-upload-restore-timezone-fixed"
 ADMIN_PIN = os.environ.get("WORKCLOCK_ADMIN_PIN", "9999")
 SUPER_ADMIN_PIN = os.environ.get("WORKCLOCK_SUPER_ADMIN_PIN", "786786")
+APP_TIMEZONE = os.environ.get("WORKCLOCK_TIMEZONE", "America/Chicago")
 
 # Railway production MUST use a persistent volume.
 # Set Railway variable: WORKCLOCK_DB_PATH=/data/workclock.db
@@ -67,7 +69,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def now():
-    return datetime.now()
+    try:
+        return datetime.now(ZoneInfo(APP_TIMEZONE))
+    except Exception:
+        return datetime.now()
 
 def now_text():
     return now().strftime("%m/%d/%Y %I:%M:%S %p")
@@ -440,6 +445,66 @@ def backup_list():
     ensure_dirs()
     return sorted(Path(BACKUP_DIR).glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
 
+def inspect_db_file(path):
+    info = {"valid": False, "employees": 0, "attendance": 0, "audit_log": 0, "error": ""}
+    try:
+        con = sqlite3.connect(str(path))
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {r[0] for r in cur.fetchall()}
+        required = {"employees", "attendance"}
+        if not required.issubset(tables):
+            info["error"] = "Uploaded DB is missing employees/attendance tables."
+            con.close()
+            return info
+        for table in ["employees", "attendance", "audit_log"]:
+            if table in tables:
+                info[table] = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        con.close()
+        info["valid"] = True
+        return info
+    except Exception as e:
+        info["error"] = str(e)
+        return info
+
+def restore_uploaded_db(uploaded_file):
+    ensure_dirs()
+    temp_path = Path(BACKUP_DIR) / f"uploaded_restore_{now().strftime('%Y%m%d_%H%M%S')}.db"
+    temp_path.write_bytes(uploaded_file.getvalue())
+    info = inspect_db_file(temp_path)
+    if not info["valid"]:
+        try:
+            temp_path.unlink()
+        except Exception:
+            pass
+        return False, info, "Uploaded file is not a valid WorkClock database."
+
+    # Save current DB before replacing it.
+    backup_file("before_uploaded_db_restore")
+
+    # Close current connection, replace DB, remove stale WAL/SHM sidecars, and force restart.
+    try:
+        checkpoint_db()
+    except Exception:
+        pass
+    try:
+        CON.close()
+    except Exception:
+        pass
+
+    target = Path(DB_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(temp_path, target)
+    for sidecar in [str(target) + "-wal", str(target) + "-shm"]:
+        try:
+            Path(sidecar).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    st.cache_resource.clear()
+    return True, info, f"Uploaded DB restored into {DB_PATH}. Restart/redeploy app now."
+
 def save_manual_shift(emp_id, emp_name, emp_team, work_day, punch_in, break_start, break_end, punch_out, notes, rowid=None):
     backup_file("before_manual_payroll_edit")
     bh, wh = calc_hours(punch_in, break_start, break_end, punch_out)
@@ -709,6 +774,38 @@ elif page == "Admin":
         att = read_sql("SELECT * FROM attendance ORDER BY rowid DESC")
         aud = read_sql("SELECT * FROM audit_log ORDER BY rowid DESC")
         st.download_button("Emergency Full Excel Export", excel_bytes(att, aud, "Emergency Full Backup", "", ""), f"egala_spot_emergency_backup_{today_text()}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+        st.subheader("Upload Database Restore")
+        st.warning("Use this only to move the good localhost database into Railway. This REPLACES the current Railway database.")
+        uploaded_db = st.file_uploader("Upload good WorkClock .db file", type=["db", "sqlite", "sqlite3"], key="uploaded_db_restore")
+        upload_pin = st.text_input("Super Admin PIN for uploaded restore", type="password", key="uploaded_restore_pin")
+        if uploaded_db is not None:
+            temp_preview = Path(BACKUP_DIR) / "_preview_uploaded_workclock.db"
+            try:
+                ensure_dirs()
+                temp_preview.write_bytes(uploaded_db.getvalue())
+                preview = inspect_db_file(temp_preview)
+                if preview["valid"]:
+                    st.success(f"Uploaded DB looks valid: {preview['employees']} employees, {preview['attendance']} attendance rows, {preview['audit_log']} audit rows.")
+                else:
+                    st.error(preview.get("error") or "Uploaded DB is not valid.")
+            finally:
+                try:
+                    temp_preview.unlink()
+                except Exception:
+                    pass
+        if st.button("Restore Uploaded Database", use_container_width=True, key="restore_uploaded_database"):
+            if upload_pin != SUPER_ADMIN_PIN:
+                st.error("Wrong Super Admin PIN.")
+            elif uploaded_db is None:
+                st.error("Choose a .db file first.")
+            else:
+                ok, info, message = restore_uploaded_db(uploaded_db)
+                if ok:
+                    st.success(message)
+                    st.info(f"Restored DB contains {info['employees']} employees and {info['attendance']} attendance rows. Restart/redeploy the app now.")
+                else:
+                    st.error(message)
 
         st.subheader("Backup History")
         files = backup_list()
