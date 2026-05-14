@@ -9,14 +9,24 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "2.1-safe-production-corrected"
+APP_VERSION = "2.2-production-persistence-locked"
 ADMIN_PIN = os.environ.get("WORKCLOCK_ADMIN_PIN", "9999")
 SUPER_ADMIN_PIN = os.environ.get("WORKCLOCK_SUPER_ADMIN_PIN", "786786")
 
-# Railway should use persistent volume:
-# WORKCLOCK_DB_PATH=/data/workclock.db
+# Railway production MUST use a persistent volume.
+# Set Railway variable: WORKCLOCK_DB_PATH=/data/workclock.db
+# Set Railway variable: WORKCLOCK_BACKUP_DIR=/data/backups
+# This app intentionally refuses unsafe fallback to plain workclock.db in production.
+IS_RAILWAY = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_SERVICE_ID"))
 DB_PATH = os.environ.get("WORKCLOCK_DB_PATH", "/data/workclock.db" if Path("/data").exists() else "workclock.db")
-BACKUP_DIR = os.environ.get("WORKCLOCK_BACKUP_DIR", "/data/backups" if Path("/data").exists() else "backups")
+BACKUP_DIR = os.environ.get("WORKCLOCK_BACKUP_DIR", "/data/backups" if str(DB_PATH).startswith("/data/") else "backups")
+
+if IS_RAILWAY and not str(DB_PATH).startswith("/data/"):
+    st.error("CRITICAL: Railway is not using persistent storage. Set WORKCLOCK_DB_PATH=/data/workclock.db and mount a Railway volume at /data. App stopped to prevent data loss.")
+    st.stop()
+if IS_RAILWAY and not Path("/data").exists():
+    st.error("CRITICAL: Railway /data volume is missing. Mount the persistent volume at /data. App stopped to prevent data loss.")
+    st.stop()
 
 LOCAL_NAMES = {"Syed Hassan", "Maria Shuja", "Meryem E", "Maryem E", "Omer H", "Omar H"}
 LOCAL_TEAMS = {"local", "local il", "admin", "wh", "warehouse"}
@@ -88,6 +98,16 @@ def get_conn():
     return con
 
 CON = get_conn()
+
+
+def checkpoint_db():
+    """Flush SQLite WAL changes into the main DB file before backup/download."""
+    try:
+        CON.commit()
+        CON.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        CON.commit()
+    except Exception:
+        pass
 
 def exec_sql(q, p=()):
     CON.execute(q, p)
@@ -177,6 +197,7 @@ def migrate():
 
 def backup_file(reason="backup"):
     ensure_dirs()
+    checkpoint_db()
     source = Path(DB_PATH)
     if not source.exists() or source.stat().st_size == 0:
         return ""
@@ -187,6 +208,7 @@ def backup_file(reason="backup"):
     return str(dest)
 
 def daily_backup_once():
+    checkpoint_db()
     key = f"daily_backup_{today_text()}"
     if st.session_state.get(key):
         return
@@ -411,7 +433,7 @@ def excel_bytes(summary, details, title, start, end):
     return out.getvalue()
 
 def db_bytes():
-    CON.commit()
+    checkpoint_db()
     return Path(DB_PATH).read_bytes() if Path(DB_PATH).exists() else b""
 
 def backup_list():
@@ -701,7 +723,9 @@ elif page == "Admin":
                     st.error("Wrong Super Admin PIN.")
                 else:
                     backup_file("before_restore")
+                    checkpoint_db()
                     shutil.copy2(Path(BACKUP_DIR)/choice, DB_PATH)
+                    st.cache_resource.clear()
                     st.success("Backup restored. Restart app now.")
         else:
             st.info("No backups yet.")
