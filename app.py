@@ -445,6 +445,59 @@ def backup_list():
     ensure_dirs()
     return sorted(Path(BACKUP_DIR).glob("*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
 
+
+def permanently_delete_employee(emp_id):
+    """Permanently remove an employee and linked records from the live DB and DB backups."""
+    employee_id = cid(emp_id)
+    if not employee_id:
+        raise ValueError("Employee ID is required.")
+
+    # Delete from the live database in one transaction.
+    CON.execute("BEGIN IMMEDIATE")
+    try:
+        CON.execute("DELETE FROM attendance WHERE upper(trim(id))=?", (employee_id,))
+        CON.execute("DELETE FROM audit_log WHERE upper(trim(id))=?", (employee_id,))
+        cur = CON.execute("DELETE FROM employees WHERE upper(trim(id))=?", (employee_id,))
+        if cur.rowcount == 0:
+            raise ValueError("Employee was not found; nothing was deleted.")
+        CON.commit()
+    except Exception:
+        CON.rollback()
+        raise
+
+    # Remove the same employee-linked rows from retained SQLite backup files too.
+    checkpoint_db()
+    live_path = Path(DB_PATH).resolve()
+    cleaned_backups = 0
+    backup_errors = []
+    for backup_path in Path(BACKUP_DIR).glob("*.db"):
+        try:
+            if backup_path.resolve() == live_path:
+                continue
+            backup_con = sqlite3.connect(str(backup_path))
+            try:
+                tables = {r[0] for r in backup_con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                backup_con.execute("BEGIN IMMEDIATE")
+                if "attendance" in tables:
+                    backup_con.execute("DELETE FROM attendance WHERE upper(trim(id))=?", (employee_id,))
+                if "audit_log" in tables:
+                    backup_con.execute("DELETE FROM audit_log WHERE upper(trim(id))=?", (employee_id,))
+                if "employees" in tables:
+                    backup_con.execute("DELETE FROM employees WHERE upper(trim(id))=?", (employee_id,))
+                backup_con.commit()
+                cleaned_backups += 1
+            except Exception:
+                backup_con.rollback()
+                raise
+            finally:
+                backup_con.close()
+        except Exception as exc:
+            backup_errors.append(f"{backup_path.name}: {exc}")
+
+    # Keep a non-identifying audit event; no employee ID or name is retained.
+    audit("Permanent Employee Deletion", None, "OK", "Employee and linked attendance/payroll records permanently deleted", "")
+    return cleaned_backups, backup_errors
+
 def inspect_db_file(path):
     info = {"valid": False, "employees": 0, "attendance": 0, "audit_log": 0, "error": ""}
     try:
@@ -604,6 +657,11 @@ elif page == "Admin":
         st.stop()
     st.info(f"Storage: SQLite at {DB_PATH} | Backup folder: {BACKUP_DIR} | Version: {APP_VERSION}")
 
+    # Show one-time confirmations after Streamlit reruns the page.
+    delete_notice = st.session_state.pop("employee_delete_notice", "")
+    if delete_notice:
+        st.success(delete_notice)
+
     tabs = st.tabs(["Dashboard","Employees","Attendance","AuditLog","Backup / Restore"])
 
     with tabs[0]:
@@ -733,7 +791,7 @@ elif page == "Admin":
 
         with tdel:
             st.subheader("Delete Employee")
-            st.warning("This soft-deletes employee from active screens but keeps attendance/payroll history.")
+            st.warning("PERMANENT DELETION: removes the employee, all attendance/payroll rows, and matching records in local SQLite backups. This cannot be undone.")
             super_pin = st.text_input("Super Admin PIN", type="password", key="delete_super_pin")
             emp_del = all_emps()
             if not emp_del.empty:
@@ -743,11 +801,19 @@ elif page == "Admin":
                     if super_pin != SUPER_ADMIN_PIN:
                         st.error("Wrong Super Admin PIN.")
                     else:
-                        backup_file("before_delete_employee")
-                        exec_sql("UPDATE employees SET active='inactive',deleted=1,updated_at=? WHERE id=?", (now_text(), row["id"]))
-                        audit("Delete Employee", row, "deleted", "Soft deleted employee", "")
-                        st.success("Employee deleted from active screens. History kept.")
-                        st.rerun()
+                        try:
+                            cleaned_backups, backup_errors = permanently_delete_employee(row["id"])
+                            notice = (
+                                f"{row['name']} (ID {row['id']}) and all linked attendance/payroll records "
+                                "were permanently deleted from the live database. "
+                                f"Checked {cleaned_backups} SQLite backup file(s)."
+                            )
+                            if backup_errors:
+                                notice += " WARNING: Some backup files could not be cleaned: " + "; ".join(backup_errors)
+                            st.session_state["employee_delete_notice"] = notice
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Deletion failed: {exc}")
 
     with tabs[2]:
         st.subheader("Attendance")
