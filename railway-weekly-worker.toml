@@ -1,0 +1,3 @@
+[deploy]
+startCommand = "python weekly_report_worker.py"
+restartPolicyType = "NEVER"
