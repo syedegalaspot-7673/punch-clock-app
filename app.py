@@ -9,8 +9,9 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from weekly_report_email import previous_completed_week, send_weekly_report, send_test_email
 
-APP_VERSION = "2.3-upload-restore-timezone-fixed"
+APP_VERSION = "2.4-weekly-email-report"
 ADMIN_PIN = os.environ.get("WORKCLOCK_ADMIN_PIN", "9999")
 SUPER_ADMIN_PIN = os.environ.get("WORKCLOCK_SUPER_ADMIN_PIN", "786786")
 APP_TIMEZONE = os.environ.get("WORKCLOCK_TIMEZONE", "America/Chicago")
@@ -911,6 +912,32 @@ elif page == "Payroll":
     local_details = base[(base["work_date_dt"] >= pd.to_datetime(local_start)) & (base["work_date_dt"] <= pd.to_datetime(local_end))].drop(columns=["work_date_dt","work_num","break_num"], errors="ignore") if not base.empty else pd.DataFrame()
     st.dataframe(local_summary, use_container_width=True, hide_index=True)
     st.download_button("Download Weekly Local Payroll Excel", excel_bytes(local_summary, local_details, "Weekly Local Payroll", local_start, local_end), f"weekly_local_payroll_{local_start}_to_{local_end}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+    st.divider()
+    st.subheader("Email Previous Completed Week")
+    report_start, report_end = previous_completed_week(now().date())
+    st.write(f"**Report period:** {report_start:%B %d, %Y} – {report_end:%B %d, %Y}")
+    report_recipient = os.getenv("WORKCLOCK_REPORT_RECIPIENT", "syedegalaspot@gmail.com")
+    st.write(f"**Recipient:** {report_recipient}")
+    st.caption("Sends one PDF summary and one Excel workbook. Hours only; no wage or hourly-rate information. Sending does not approve payroll.")
+    send_col, test_col = st.columns(2)
+    with send_col:
+        if st.button("Send Previous Week's Report Now", use_container_width=True, key="send_previous_week_report"):
+            try:
+                with st.spinner("Generating and sending weekly report..."):
+                    result = send_weekly_report(DB_PATH, report_start, report_end, report_recipient)
+                st.success(f"Report sent to {result['recipient']}. Employees: {result['employees']}; total hours: {result['total_hours']:.2f}; overtime: {result['overtime_hours']:.2f}; exceptions: {result['exceptions']}.")
+                audit("Weekly Report Email Sent", None, "Sent", f"Period {report_start} to {report_end}; recipient {result['recipient']}; exceptions {result['exceptions']}", "Hours-only report; no wages included")
+            except Exception as exc:
+                st.error(f"Report was not sent: {exc}")
+                audit("Weekly Report Email Failed", None, "Failed", str(exc), f"Period {report_start} to {report_end}")
+    with test_col:
+        if st.button("Send Test Email", use_container_width=True, key="send_weekly_test_email"):
+            try:
+                sent_to = send_test_email(report_recipient)
+                st.success(f"Test email sent to {sent_to}.")
+            except Exception as exc:
+                st.error(f"Test email was not sent: {exc}")
 
     st.divider()
     st.subheader("Monthly Overseas Report")
